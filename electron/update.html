@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Open Attendance Terminal — Güncelleme</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f6f7f9; color: #171717; font: 16px Arial, sans-serif; }
+    main { width: min(440px, calc(100vw - 32px)); padding: 34px; background: white; border: 1px solid #e4e5e8; border-radius: 16px; box-shadow: 0 16px 40px #0000000d; }
+    .brand { color: #ed1c24; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 14px 0 12px; font-size: 26px; }
+    p { margin: 0 0 22px; line-height: 1.5; color: #555; overflow-wrap: anywhere; }
+    .track { height: 9px; overflow: hidden; border-radius: 10px; background: #f2e4e4; }
+    .bar { width: 0; height: 100%; border-radius: inherit; background: #ed1c24; transition: width .2s; }
+    .percent { margin-top: 9px; color: #666; font-size: 13px; text-align: right; }
+    button.secondary { background: white; color: #ed1c24; border: 1px solid #ed1c24; margin-top: 10px; }
+    .hint { display: none; margin: 10px 0 0; font-size: 12px; color: #777; }
+    button { display: none; width: 100%; margin-top: 18px; padding: 13px; border: 0; border-radius: 8px; background: #ed1c24; color: white; font-weight: 700; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand">Open Attendance</div>
+    <h1>Personel Takip Terminali</h1>
+    <p id="message" role="status">Yeni sürüm kontrol ediliyor…</p>
+    <div class="track"><div class="bar" id="bar"></div></div>
+    <div class="percent" id="percent"></div>
+    <button id="retry" type="button">Tekrar Dene</button>
+    <button id="skip" class="secondary" type="button">Güncellemeden Devam Et</button>
+    <p class="hint" id="hint">Güncelleme bir sonraki açılışta yeniden denenir. Yeni sürüm bulunursa kurulum zorunludur.</p>
+  </main>
+  <script>
+    const message = document.getElementById('message');
+    const bar = document.getElementById('bar');
+    const percent = document.getElementById('percent');
+    const retry = document.getElementById('retry');
+    const skip = document.getElementById('skip');
+    const hint = document.getElementById('hint');
+    function render(status) {
+      message.textContent = status.message;
+      const value = Math.max(0, Math.min(100, Number(status.percent) || 0));
+      bar.style.width = `${value}%`;
+      percent.textContent = status.state === 'downloading' ? `%${value}` : '';
+      retry.style.display = status.state === 'error' ? 'block' : 'none';
+      const canSkip = status.state === 'error' && status.canSkip === true;
+      skip.style.display = canSkip ? 'block' : 'none';
+      hint.style.display = canSkip ? 'block' : 'none';
+    }
+    retry.addEventListener('click', () => window.desktop.retryUpdate());
+    skip.addEventListener('click', () => window.desktop.skipUpdate());
+    window.desktop.onUpdateStatus(render);
+    window.desktop.getUpdateStatus().then(render);
+  </script>
+</body>
+</html>

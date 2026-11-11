@@ -1,0 +1,13 @@
+node_modules/
+dist/
+release/
+.env
+firebase-public/updates/
+.firebase/
+.firebaserc
+firebase-debug.log
+*.log
+.env.local
+.env.*.local
+service-account*.json
+*firebase-adminsdk*.json

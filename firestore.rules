@@ -1,0 +1,595 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function profilePath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function hasProfile() { return signedIn() && exists(profilePath()); }
+    function profile() { return get(profilePath()).data; }
+    function isAdmin() { return hasProfile() && profile().admin == true; }
+    function hasMenu(menu) { return hasProfile() && (isAdmin() || menu in profile().menus); }
+    function hasAnyPermission() { return isAdmin() || (hasProfile() && profile().menus.size() > 0); }
+    function isNumber(value) { return value is int || value is float; }
+    function validMoney(value) { return isNumber(value) && value >= 0 && value <= 1000000000; }
+    function validRate(value) { return isNumber(value) && value >= 0 && value <= 1000000; }
+    function optionalRate(value) { return value == null || validRate(value); }
+    function validDate(value) {
+      let parts = value.split('-');
+      let parsed = timestamp.date(int(parts[0]), int(parts[1]), int(parts[2]));
+      return value is string
+        && value.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && parsed.year() == int(parts[0])
+        && parsed.month() == int(parts[1])
+        && parsed.day() == int(parts[2]);
+    }
+    function validTime(value) {
+      return value is string
+        && value.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$');
+    }
+    // payroll.validateRules ile aynı: mola < çalışma aralığı ve hedef <= aralık - mola.
+    // dailyTargetMinutes > 0 ayrıca doğrulandığından tek karşılaştırma iki koşulu birlikte sağlar.
+    function validSettingsInterval(data) {
+      return data.breakMinutes + data.dailyTargetMinutes
+        <= (int(data.endTime[0:2]) - int(data.startTime[0:2])) * 60 + int(data.endTime[3:5]) - int(data.startTime[3:5]);
+    }
+    // İstemci kısmi temel ayarları DEFAULT_SETTINGS ile birleştirir; aynı birleşik değerler denetlenir.
+    function validMergedSettingsInterval(data) {
+      return validSettingsInterval({
+        'startTime': data.get('startTime', '09:00'),
+        'endTime': data.get('endTime', '18:00'),
+        'breakMinutes': data.get('breakMinutes', 60),
+        'dailyTargetMinutes': data.get('dailyTargetMinutes', 480)
+      });
+    }
+
+    // Mesai ücretini yalnız Puantaj yetkisine ek olarak Personeller veya Ayarlar yetkisi olanlar belirler.
+    function canEditRates() { return hasMenu('timesheet') && (hasMenu('employees') || hasMenu('settings')); }
+    function directoryPath(employeeId) { return /databases/$(database)/documents/employeeDirectory/$(employeeId); }
+    function cardDirectoryPath(employeeId) { return /databases/$(database)/documents/cardDirectory/$(employeeId); }
+    function employeeCardPath(employeeId) { return /databases/$(database)/documents/employeeCards/$(employeeId); }
+    function cardUidPath(cardUid) { return /databases/$(database)/documents/cardUids/$(cardUid); }
+    function inventoryPath(cardUid) { return /databases/$(database)/documents/cardInventory/$(cardUid); }
+    function validCardUid(cardUid) {
+      return cardUid is string
+        && (cardUid.size() == 8 || cardUid.size() == 14 || cardUid.size() == 20)
+        && cardUid.matches('^[0-9A-F]+$');
+    }
+    function historyPath(historyId) { return /databases/$(database)/documents/cardHistory/$(historyId); }
+    // Silme yetkisi kart eşleşmesine yalnız personelin kendisi aynı işlemde silinirken dokunabilir.
+    function deletingEmployee(employeeId) {
+      return hasMenu('employees') && hasMenu('deleteEmployee') && !existsAfter(directoryPath(employeeId));
+    }
+    // Türkiye saati (UTC+3) ile verilen günün başlangıcı.
+    function dayStartTr(value) {
+      let parts = value.split('-');
+      return timestamp.date(int(parts[0]), int(parts[1]), int(parts[2])) - duration.value(3, 'h');
+    }
+    // İşten ayrılmış veya bugün/öncesinde çıkış tarihi olan personele kart verilmez.
+    function stillEmployed(employeeId) {
+      let person = getAfter(directoryPath(employeeId)).data;
+      return person.active == true && (person.endDate == '' || request.time < dayStartTr(person.endDate));
+    }
+    // Her kart değişikliği kartın işlem sayacını tam bir artırır ve o numaralı geçmiş kaydını aynı işlemde yazar.
+    function cardEventLogged(cardUid) {
+      let after = getAfter(inventoryPath(cardUid)).data;
+      return after.events == get(inventoryPath(cardUid)).data.events + 1
+        && existsAfter(historyPath(cardUid + '_' + string(after.events)));
+    }
+    function validEmployeeCard(employeeId) {
+      let data = request.resource.data;
+      let oldUid = resource == null ? null : resource.data.cardUid;
+      return data.keys().hasOnly(['employeeId', 'cardUid'])
+        && data.keys().hasAll(['employeeId', 'cardUid'])
+        && data.employeeId == employeeId
+        && validCardUid(data.cardUid)
+        && getAfter(cardUidPath(data.cardUid)).data.employeeId == employeeId
+        && getAfter(cardUidPath(data.cardUid)).data.cardUid == data.cardUid
+        && (oldUid == null || oldUid == data.cardUid || !existsAfter(cardUidPath(oldUid)));
+    }
+    // assignedAt (0.4.0): kartın bu personele verildiği an (sunucu saati). Çevrimdışı okutma bundan önceyse
+    // kart o sırada başkasındaydı; kayıt yeni sahibine yazılmaz (offlineScan).
+    function validCardIndex(cardUid) {
+      let data = request.resource.data;
+      return data.keys().hasOnly(['employeeId', 'cardUid', 'assignedAt'])
+        && data.keys().hasAll(['employeeId', 'cardUid'])
+        // Eski 0.3.x istemcileri assignedAt yazmaz; çevrimiçi kullanım sürer, ancak bu eşleşme
+        // v0.4 tarafından damgalanana kadar çevrimdışı okutma offlineScan içinde reddedilir.
+        && (!('assignedAt' in data) || data.assignedAt == request.time)
+        && data.cardUid == cardUid
+        && validCardUid(cardUid)
+        && stillEmployed(data.employeeId)
+        && existsAfter(cardDirectoryPath(data.employeeId))
+        && getAfter(employeeCardPath(data.employeeId)).data.employeeId == data.employeeId
+        && getAfter(employeeCardPath(data.employeeId)).data.cardUid == cardUid
+        // Kart yalnız Kart Listesi'nde kayıtlı ve kayıp değilse atanabilir.
+        && getAfter(inventoryPath(cardUid)).data.lost == false
+        && cardEventLogged(cardUid);
+    }
+    function validLegacyCardIndexUpgrade(cardUid) {
+      let data = request.resource.data;
+      return data.keys().hasOnly(['employeeId', 'cardUid', 'assignedAt'])
+        && data.keys().hasAll(['employeeId', 'cardUid', 'assignedAt'])
+        && data.employeeId == resource.data.employeeId
+        && data.cardUid == resource.data.cardUid && data.cardUid == cardUid
+        && data.assignedAt == request.time
+        && stillEmployed(data.employeeId)
+        && existsAfter(cardDirectoryPath(data.employeeId))
+        && getAfter(employeeCardPath(data.employeeId)).data.employeeId == data.employeeId
+        && getAfter(employeeCardPath(data.employeeId)).data.cardUid == cardUid
+        && getAfter(inventoryPath(cardUid)).data.lost == false;
+    }
+    function validInventoryCard(cardUid) {
+      let data = request.resource.data;
+      return data.keys().hasOnly(['cardUid', 'label', 'lost', 'events'])
+        && data.keys().hasAll(['cardUid', 'label', 'lost', 'events'])
+        && data.cardUid == cardUid
+        && validCardUid(cardUid)
+        && data.label is string && data.label.size() > 0 && data.label.size() <= 20
+        && data.lost is bool
+        && data.events is int
+        // Kayıp işaretlenen kartın ataması aynı işlemde kalkmış olmalı.
+        && (data.lost == false || !existsAfter(cardUidPath(cardUid)));
+    }
+    function recentDate(value) {
+      let day = dayStartTr(value);
+      return day > request.time - duration.value(2, 'd') && day < request.time + duration.value(1, 'd');
+    }
+    // Kart geçmişi yalnız eklenir. Her kayıt, işlemden önceki ve sonraki gerçek durum arasındaki tek bir değişikliği anlatır.
+    function validCardHistory(historyId) {
+      let data = request.resource.data;
+      let uid = data.cardUid;
+      let before = get(inventoryPath(uid)).data;
+      let after = getAfter(inventoryPath(uid)).data;
+      let heldBefore = exists(cardUidPath(uid));
+      let heldAfter = existsAfter(cardUidPath(uid));
+      return data.keys().hasOnly(['cardUid', 'employeeId', 'employeeName', 'action', 'date', 'at'])
+        && data.keys().hasAll(['cardUid', 'employeeId', 'employeeName', 'action', 'date', 'at'])
+        && validCardUid(uid)
+        && after.events == before.events + 1
+        && historyId == uid + '_' + string(after.events)
+        && data.employeeId is string && data.employeeId.size() <= 128
+        && data.employeeName is string
+        && (data.employeeId == ''
+          ? data.employeeName == ''
+          : data.employeeName == get(cardDirectoryPath(data.employeeId)).data.name)
+        && validDate(data.date) && recentDate(data.date)
+        && data.at == request.time
+        && ((data.action == 'assigned' && before.lost == false && after.lost == false
+              && !heldBefore && heldAfter && getAfter(cardUidPath(uid)).data.employeeId == data.employeeId)
+          || (data.action == 'returned' && before.lost == false && after.lost == false
+              && heldBefore && !heldAfter && get(cardUidPath(uid)).data.employeeId == data.employeeId)
+          || (data.action == 'lost' && before.lost == false && after.lost == true && !heldAfter
+              && (heldBefore ? get(cardUidPath(uid)).data.employeeId == data.employeeId : data.employeeId == ''))
+          || (data.action == 'found' && before.lost == true && after.lost == false
+              && !heldBefore && data.employeeId == ''));
+    }
+    function validSalaryHistoryItem(item) {
+      return item.keys().hasOnly(['effectiveMonth', 'salary', 'bank'])
+        && item.keys().hasAll(['effectiveMonth', 'salary', 'bank'])
+        && item.effectiveMonth is string
+        && item.effectiveMonth.matches('^[0-9]{4}-[0-9]{2}$')
+        && validDate(item.effectiveMonth + '-01')
+        && validMoney(item.salary)
+        && validMoney(item.bank) && item.bank <= item.salary;
+    }
+    function validSalaryHistoryAt(history, index) {
+      return history.size() <= index
+        || (validSalaryHistoryItem(history[index])
+          && (index == 0 || history[index].effectiveMonth > history[index - 1].effectiveMonth));
+    }
+    function validSalaryHistory(history) {
+      return history is list && history.size() > 0 && history.size() <= 20
+        && validSalaryHistoryAt(history, 0) && validSalaryHistoryAt(history, 1)
+        && validSalaryHistoryAt(history, 2) && validSalaryHistoryAt(history, 3)
+        && validSalaryHistoryAt(history, 4) && validSalaryHistoryAt(history, 5)
+        && validSalaryHistoryAt(history, 6) && validSalaryHistoryAt(history, 7)
+        && validSalaryHistoryAt(history, 8) && validSalaryHistoryAt(history, 9)
+        && validSalaryHistoryAt(history, 10) && validSalaryHistoryAt(history, 11)
+        && validSalaryHistoryAt(history, 12) && validSalaryHistoryAt(history, 13)
+        && validSalaryHistoryAt(history, 14) && validSalaryHistoryAt(history, 15)
+        && validSalaryHistoryAt(history, 16) && validSalaryHistoryAt(history, 17)
+        && validSalaryHistoryAt(history, 18) && validSalaryHistoryAt(history, 19);
+    }
+    function validEmployee(employeeId) {
+      let data = request.resource.data;
+      return data.keys().hasOnly(['id', 'name', 'company', 'startDate', 'endDate', 'active', 'salary', 'bank', 'overtimeRate', 'salaryHistory'])
+        && data.keys().hasAll(['id', 'name', 'startDate', 'salary', 'bank'])
+        && data.id == employeeId
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 200
+        && (!('company' in data) || (data.company is string && data.company.size() <= 120))
+        && validDate(data.startDate)
+        && (!('endDate' in data) || data.endDate == '' || (validDate(data.endDate) && data.endDate >= data.startDate))
+        && (!('active' in data) || data.active is bool)
+        && validMoney(data.salary)
+        && validMoney(data.bank) && data.bank <= data.salary
+        && optionalRate(data.get('overtimeRate', null))
+        && (!('salaryHistory' in data) || validSalaryHistory(data.salaryHistory));
+    }
+    // Puantaj yetkilisinin her kaydı editedAt == sunucu saati ile damgalanır (0.4.0); daha önce okutulup
+    // sonradan gönderilen çevrimdışı okutma bu elle düzeltmenin üstüne yazılamaz (terminalEntryUpdate).
+    function validEntry(entryId) {
+      let data = request.resource.data;
+      return data.keys().hasOnly(['id', 'employeeId', 'date', 'status', 'start', 'end', 'rate', 'cardUid', 'editedAt'])
+        // v0.4 elle düzeltmeleri damgalar. 0.3.x istemcisinin damgasız eski kayıt yazımı çevrimiçi
+        // uyumluluk için kabul edilir; bu kayıt source:'offline' taşımadığı için geç replay ile uzatılamaz.
+        && ((!('editedAt' in data) && (resource == null || !('editedAt' in resource.data)))
+          || data.editedAt == request.time)
+        && data.id == entryId
+        && entryId == data.employeeId + '_' + data.date
+        && data.employeeId is string && exists(directoryPath(data.employeeId))
+        && validDate(data.date)
+        && data.status in ['present', 'absent', 'leave']
+        && (data.status != 'present'
+          || (validTime(data.start) && validTime(data.end) && data.end > data.start))
+        && (!('start' in data) || validTime(data.start))
+        && (!('end' in data) || validTime(data.end))
+        && (!('cardUid' in data) || validCardUid(data.cardUid))
+        && optionalRate(data.get('rate', null));
+    }
+    // Ücret yetkisi olmayan kullanıcı yeni kaydı yalnız rate=null ile oluşturabilir.
+    function createRateAllowed() {
+      return canEditRates() || request.resource.data.get('rate', null) == null;
+    }
+    // Mevcut dolu ücret ancak rate, employeeId ve date birlikte değişmeden korunabilir.
+    function updateRateAllowed() {
+      return canEditRates()
+        || (request.resource.data.get('rate', null) == resource.data.get('rate', null)
+          && request.resource.data.employeeId == resource.data.employeeId
+          && request.resource.data.date == resource.data.date);
+    }
+    function validDirectoryEmployee(employeeId) {
+      let data = request.resource.data;
+      return data.keys().hasOnly(['id', 'name', 'company', 'startDate', 'endDate', 'active', 'overtimeRate'])
+        && data.keys().hasAll(['id', 'name', 'company', 'startDate', 'endDate', 'active', 'overtimeRate'])
+        && data.id == employeeId
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 200
+        && data.company is string && data.company.size() <= 120
+        && validDate(data.startDate)
+        && (data.endDate == '' || (validDate(data.endDate) && data.endDate >= data.startDate))
+        && data.active is bool
+        && optionalRate(data.overtimeRate);
+    }
+    // Kart Atama'nın gördüğü kısa liste, personel dizinindeki ad/şirket/durum/çıkış tarihiyle aynı olmalıdır.
+    function validCardDirectoryEmployee(employeeId) {
+      let data = request.resource.data;
+      let person = getAfter(directoryPath(employeeId)).data;
+      return data.keys().hasOnly(['id', 'name', 'company', 'active', 'endDate'])
+        && data.keys().hasAll(['id', 'name', 'company', 'active', 'endDate'])
+        && data.id == employeeId
+        && data.name == person.name
+        && data.company == person.company
+        && data.active == person.active
+        && data.endDate == person.endDate;
+    }
+    function validWorkdays(value) {
+      // Tekrarsız ve yalnız 0-6 içeren liste en fazla 7 elemanlıdır.
+      return value is list && value.size() > 0
+        && value.hasOnly([0, 1, 2, 3, 4, 5, 6])
+        && value.toSet().size() == value.size();
+    }
+    // Tüm hesaplama alanları mevcutken kullanılan ortak doğrulama (Firestore ifade sınırı için tek kopya).
+    // Aralık koşulu (mola >= 0, hedef >= 1) çıkışın girişten sonra olmasını ve 1439/1440 üst sınırlarını zaten içerir.
+    function validBaseSettingsFields(data) {
+      return validWorkdays(data.workdays)
+        && validTime(data.startTime) && validTime(data.endTime)
+        && data.breakMinutes is int && data.breakMinutes >= 0
+        && data.dailyTargetMinutes is int && data.dailyTargetMinutes > 0
+        && validSettingsInterval(data)
+        && data.salaryDays is int && data.salaryDays > 0 && data.salaryDays <= 31
+        && validRate(data.overtimeRate)
+        && data.overtimeRoundMinutes in [15, 30, 60]
+        && data.deductionOrder in ['extra-first', 'overtime-first']
+        && data.allowBankDeduction is bool
+        && data.carryForward is bool;
+    }
+    function validSettingsRules(data) {
+      return data is map
+        && data.size() == 11
+        && data.keys().hasAll(['workdays', 'startTime', 'endTime', 'breakMinutes', 'dailyTargetMinutes', 'salaryDays', 'overtimeRate', 'overtimeRoundMinutes', 'deductionOrder', 'allowBankDeduction', 'carryForward'])
+        && validBaseSettingsFields(data);
+    }
+    function validOptionalSettings(data) {
+      return data.keys().hasAll(['workdays', 'startTime', 'endTime', 'breakMinutes', 'dailyTargetMinutes', 'salaryDays', 'overtimeRate', 'overtimeRoundMinutes', 'deductionOrder', 'allowBankDeduction', 'carryForward'])
+        ? validBaseSettingsFields(data)
+        : (!('workdays' in data) || validWorkdays(data.workdays))
+        && (!('startTime' in data) || validTime(data.startTime))
+        && (!('endTime' in data) || validTime(data.endTime))
+        && (!('startTime' in data) || !('endTime' in data) || data.endTime > data.startTime)
+        && (!('breakMinutes' in data) || (data.breakMinutes is int && data.breakMinutes >= 0 && data.breakMinutes <= 1439))
+        && (!('dailyTargetMinutes' in data) || (data.dailyTargetMinutes is int && data.dailyTargetMinutes > 0 && data.dailyTargetMinutes <= 1440))
+        && (!data.keys().hasAny(['startTime', 'endTime', 'breakMinutes', 'dailyTargetMinutes']) || validMergedSettingsInterval(data))
+        && (!('salaryDays' in data) || (data.salaryDays is int && data.salaryDays > 0 && data.salaryDays <= 31))
+        && (!('overtimeRate' in data) || validRate(data.overtimeRate))
+        && (!('overtimeRoundMinutes' in data) || data.overtimeRoundMinutes in [15, 30, 60])
+        && (!('deductionOrder' in data) || data.deductionOrder in ['extra-first', 'overtime-first'])
+        && (!('allowBankDeduction' in data) || data.allowBankDeduction is bool)
+        && (!('carryForward' in data) || data.carryForward is bool);
+    }
+    function validCompanyAt(companies, index) {
+      return companies.size() <= index
+        ? true
+        : companies[index] is string && companies[index].size() > 0 && companies[index].size() <= 120;
+    }
+    function validCompanies(companies) {
+      return companies is list && companies.size() <= 5 && companies.toSet().size() == companies.size()
+        && validCompanyAt(companies, 0) && validCompanyAt(companies, 1) && validCompanyAt(companies, 2) && validCompanyAt(companies, 3)
+        && validCompanyAt(companies, 4);
+    }
+    function validRevision(item) {
+      return item is map && item.keys().hasOnly(['effectiveDate', 'effectiveMonth', 'rules']) && item.keys().hasAll(['rules'])
+        && (('effectiveDate' in item && !('effectiveMonth' in item) && validDate(item.effectiveDate))
+          || ('effectiveMonth' in item && !('effectiveDate' in item) && item.effectiveMonth is string
+            && item.effectiveMonth.matches('^[0-9]{4}-[0-9]{2}$') && validDate(item.effectiveMonth + '-01')))
+        && validSettingsRules(item.rules);
+    }
+    // Daha önce doğrulanıp aynen korunan revizyonlar yeniden doğrulanmaz; böylece 10 revizyonluk
+    // belge de Firestore'un 1000 ifade sınırını aşmadan yazılabilir.
+    function validRevisionAt(history, previous, index) {
+      return history.size() <= index ? true : (history[index] in previous || validRevision(history[index]));
+    }
+    function validHistory(history, previous) {
+      return history is list && history.size() <= 10
+        && validRevisionAt(history, previous, 0) && validRevisionAt(history, previous, 1) && validRevisionAt(history, previous, 2) && validRevisionAt(history, previous, 3)
+        && validRevisionAt(history, previous, 4) && validRevisionAt(history, previous, 5) && validRevisionAt(history, previous, 6) && validRevisionAt(history, previous, 7)
+        && validRevisionAt(history, previous, 8) && validRevisionAt(history, previous, 9);
+    }
+    function previousHistory() {
+      return resource != null && resource.data.get('history', []) is list ? resource.data.get('history', []) : [];
+    }
+    function changedSettingsKeys() {
+      return resource == null ? request.resource.data.keys().toSet() : request.resource.data.diff(resource.data).affectedKeys();
+    }
+    function validSettings() {
+      let data = request.resource.data;
+      let changed = changedSettingsKeys();
+      return data.keys().hasOnly(['workdays', 'startTime', 'endTime', 'breakMinutes', 'dailyTargetMinutes', 'salaryDays', 'overtimeRate', 'overtimeRoundMinutes', 'deductionOrder', 'allowBankDeduction', 'carryForward', 'companies', 'history'])
+        && (!changed.hasAny(['workdays', 'startTime', 'endTime', 'breakMinutes', 'dailyTargetMinutes', 'salaryDays', 'overtimeRate', 'overtimeRoundMinutes', 'deductionOrder', 'allowBankDeduction', 'carryForward'])
+          || validOptionalSettings(data))
+        && (!('companies' in data) || !('companies' in changed) || validCompanies(data.companies))
+        && (!('history' in data) || !('history' in changed) || validHistory(data.history, previousHistory()));
+    }
+
+    // ---- Kart Okutma terminali (0.3.2) ----
+    // Terminal hesabı yalnız bugünün kaydına, sunucu saatine (Türkiye, UTC+3) en fazla 3 dakika farkla saat yazabilir.
+    function isDateTrAt(value, instant) {
+      let parts = value.split('-');
+      let now = instant + duration.value(3, 'h');
+      return int(parts[0]) == now.year() && int(parts[1]) == now.month() && int(parts[2]) == now.day();
+    }
+    function isTodayTr(value) { return isDateTrAt(value, request.time); }
+    // Tarih ayrı doğrulanır; dakika farkı gece yarısında önceki/sonraki güne sarılmaz.
+    function nearDateTimeTr(date, value, instant) {
+      let now = instant + duration.value(3, 'h');
+      let diff = int(value[0:2]) * 60 + int(value[3:5]) - (now.hours() * 60 + now.minutes());
+      return isDateTrAt(date, instant) && diff >= -3 && diff <= 3;
+    }
+    function nearNowTr(date, value) { return nearDateTimeTr(date, value, request.time); }
+    function entryPath(entryId) { return /databases/$(database)/documents/entries/$(entryId); }
+    function clockInPath(clockId) { return /databases/$(database)/documents/clockIns/$(clockId); }
+    function timeMinutes(value) { return int(value[0:2]) * 60 + int(value[3:5]); }
+    function terminalCardMatches(data) {
+      return 'cardUid' in data
+        && validCardUid(data.cardUid)
+        && existsAfter(cardUidPath(data.cardUid))
+        && getAfter(cardUidPath(data.cardUid)).data.employeeId == data.employeeId;
+    }
+    // ---- Wi-Fi kart okuyucu: çevrimdışı okutma (0.4.0) ----
+    // Cihaz internetsizken okutmayı kendi saatiyle (DS3231, NTP ile eşitlenir) saklar, bağlantı gelince gönderir.
+    // Bu yazımlar source:'offline' ve scanAt (okutma anı) taşır. Gevşetme yalnız zamandadır:
+    // scanAt sunucu saatinden en çok 3 dk ileri, en çok 7 gün geride olabilir; kaydın tarihi ve HH:MM saati
+    // tam olarak scanAt'in Türkiye (UTC+3) tarih/saatidir. Kart sahipliği, 15 dakika, ileri-tek-yön, ücret ve
+    // izinli/devamsız günü koruma kuralları çevrimiçi okutmayla aynıdır.
+    function validScanAt(value) {
+      return value is timestamp
+        && value <= request.time + duration.value(3, 'm')
+        && value >= request.time - duration.value(7, 'd');
+    }
+    function exactDateTimeTr(date, value, instant) {
+      let local = instant + duration.value(3, 'h');
+      return isDateTrAt(date, instant) && timeMinutes(value) == local.hours() * 60 + local.minutes();
+    }
+    // Kart okutma anında bu personelde olmalı (assignedAt <= scanAt) ve gün personelin işe başlama tarihinden önce olamaz.
+    // assignedAt taşımayan eski (0.4.0 öncesi) eşleşmeler: 0.4.0 kurallarıyla yeni eşleşme yalnız assignedAt ile
+    // oluşturulabildiğinden bunlar kurallar yayımlanmadan önce verilmiştir; çevrimdışı okutma da bu kurallarla gelir. Kabul edilir.
+    function offlineScan(data, value) {
+      let mapping = getAfter(cardUidPath(data.cardUid)).data;
+      return data.get('source', null) == 'offline'
+        && 'scanAt' in data && validScanAt(data.scanAt)
+        && exactDateTimeTr(data.date, value, data.scanAt)
+        // Damgasız eski/yeni-ama-eski-istemci eşleşmeleri çevrimiçi çalışır; geçmiş okutmanın kime ait
+        // olduğu kanıtlanamadığı için çevrimdışı replay güvenli biçimde reddedilir.
+        && 'assignedAt' in mapping && data.scanAt >= mapping.assignedAt
+        && data.date >= getAfter(directoryPath(data.employeeId)).data.startDate;
+    }
+    // Terminal, çevrimdışı okutmaları sırayla işleyebilmek için son 7 günün tek tek kayıtlarını okuyabilir (liste yok).
+    function terminalReadableDate(value) {
+      let day = dayStartTr(value);
+      return day <= request.time && day > request.time - duration.value(8, 'd');
+    }
+    // Eski istemci, açık giriş yokken aynı şekilde yazabilir; varsa kayıt aynı atomik işlemde kapatılmalıdır.
+    function matchingClockInClosed(entryId) {
+      return !exists(clockInPath(entryId)) || !existsAfter(clockInPath(entryId));
+    }
+    // Açık giriş: kart gerçekten bu personele atanmış, personel çalışıyor ve bugün için henüz puantaj kaydı yok.
+    // Çevrimdışı okutmada tarih/saat okutma anından (scanAt) alınır.
+    function validClockIn(clockId) {
+      let data = request.resource.data;
+      return data.keys().hasOnly(['id', 'employeeId', 'date', 'cardUid', 'start', 'at', 'source', 'scanAt'])
+        && data.keys().hasAll(['id', 'employeeId', 'date', 'cardUid', 'start', 'at'])
+        && data.id == clockId
+        && data.employeeId is string
+        && clockId == data.employeeId + '_' + data.date
+        && terminalCardMatches(data)
+        && stillEmployed(data.employeeId)
+        && validDate(data.date) && validTime(data.start)
+        && ((!('source' in data) && !('scanAt' in data) && nearNowTr(data.date, data.start))
+          || offlineScan(data, data.start))
+        && data.at == request.time
+        && !exists(entryPath(clockId));
+    }
+    // Çıkış: başlangıç açık girişten alınır, açık giriş aynı işlemde kapanır, ücret boş kalır.
+    // Çevrimiçi çıkış, çevrimdışı açılmış girişin işaretini (source) taşıyabilir; scanAt yalnız çevrimdışı çıkışta yazılır.
+    function terminalEntryCreate(entryId) {
+      let data = request.resource.data;
+      return data.keys().hasOnly(['id', 'employeeId', 'date', 'status', 'start', 'end', 'rate', 'cardUid', 'source', 'scanAt'])
+        && data.keys().hasAll(['id', 'employeeId', 'date', 'status', 'start', 'end', 'rate', 'cardUid'])
+        && data.id == entryId && entryId == data.employeeId + '_' + data.date
+        && data.status == 'present'
+        && data.get('rate', null) == null
+        && terminalCardMatches(data)
+        && validDate(data.date)
+        && exists(clockInPath(entryId))
+        && data.cardUid == get(clockInPath(entryId)).data.cardUid
+        && data.start == get(clockInPath(entryId)).data.start
+        && validTime(data.start) && validTime(data.end)
+        && timeMinutes(data.end) - timeMinutes(data.start) >= 15
+        && ((!('scanAt' in data) && nearNowTr(data.date, data.end)
+            && (!('source' in data)
+              || (data.source == 'offline' && get(clockInPath(entryId)).data.get('source', null) == 'offline')))
+          || offlineScan(data, data.end))
+        && !existsAfter(clockInPath(entryId));
+    }
+    // Sonraki okutma yalnız bugünün çalıştı kaydının çıkış saatini ileri alır; diğer alanlar değişmez.
+    // Çevrimdışı okutma (yeni scanAt) son 7 günün kaydını da ileri alabilir; çevrimiçi okutma işareti değiştirmez.
+    // Çevrimdışı okutma yalnız kart okutmasıyla oluşmuş (cardUid'li) bir günü ileri alır ve gün okutmadan sonra
+    // elle düzeltilmişse (editedAt >= scanAt) dokunmaz. editedAt terminal tarafından değiştirilemez.
+    function terminalEntryUpdate() {
+      let data = request.resource.data;
+      let old = resource.data;
+      return data.keys().hasOnly(['id', 'employeeId', 'date', 'status', 'start', 'end', 'rate', 'cardUid', 'source', 'scanAt', 'editedAt'])
+        && data.get('editedAt', null) == old.get('editedAt', null)
+        && data.id == old.id && data.id == data.employeeId + '_' + data.date
+        && old.status == 'present' && data.status == 'present'
+        && data.employeeId == old.employeeId && data.date == old.date && data.start == old.start
+        && data.get('rate', null) == old.get('rate', null)
+        && terminalCardMatches(data)
+        && (!('cardUid' in old) || data.cardUid == old.cardUid)
+        && validDate(data.date) && validTime(data.start) && validTime(data.end) && validTime(old.end)
+        && ((data.get('scanAt', null) == old.get('scanAt', null)
+            && data.get('source', null) == old.get('source', null)
+            && nearNowTr(data.date, data.end))
+          || (data.get('scanAt', null) != old.get('scanAt', null) && offlineScan(data, data.end)
+            // Yalnız daha önce çevrimdışı replay ile oluştuğu açıkça işaretli gün uzatılabilir.
+            // Böylece 0.4 öncesi kartlı fakat elle düzeltilmiş, editedAt'siz günler korunur.
+            && old.get('source', null) == 'offline' && 'cardUid' in old
+            && (!('editedAt' in old) || data.scanAt > old.editedAt)))
+        && timeMinutes(data.end) - timeMinutes(old.end) >= 15;
+    }
+
+    match /users/{userId} {
+      allow get: if signedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      allow create: if signedIn() && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(['email', 'name', 'admin', 'menus'])
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.admin == false
+        && request.resource.data.menus == [];
+      allow update: if isAdmin() && request.resource.data.keys().hasOnly(['email', 'name', 'admin', 'menus']);
+      allow delete: if false;
+    }
+
+    match /employees/{employeeId} {
+      allow read: if hasMenu('dashboard') || hasMenu('employees') || hasMenu('reports');
+      allow create, update: if hasMenu('employees') && validEmployee(employeeId);
+      allow delete: if hasMenu('employees') && hasMenu('deleteEmployee')
+        && !existsAfter(employeeCardPath(employeeId))
+        && !existsAfter(directoryPath(employeeId));
+    }
+    match /employeeDirectory/{employeeId} {
+      allow read: if hasMenu('timesheet') || hasMenu('dashboard') || hasMenu('employees') || hasMenu('reports') || hasMenu('settings');
+      allow create, update: if hasMenu('employees') && validDirectoryEmployee(employeeId);
+      // 0.2.15 istemcisi cardDirectory'yi silmez; geride kalan kayıt kart verilmesine izin vermez
+      // (stillEmployed silinmiş dizini okuyamaz) ve 0.3.0 eşitlemesi tarafından temizlenir.
+      allow delete: if hasMenu('employees') && hasMenu('deleteEmployee')
+        && !existsAfter(employeeCardPath(employeeId))
+        && !existsAfter(/databases/$(database)/documents/employees/$(employeeId));
+    }
+    match /cardDirectory/{employeeId} {
+      allow get: if hasMenu('cards') || hasMenu('terminal') || (hasMenu('employees') && hasMenu('deleteEmployee'));
+      allow list: if hasMenu('cards');
+      allow create, update: if hasMenu('employees') && existsAfter(directoryPath(employeeId))
+        && validCardDirectoryEmployee(employeeId);
+      allow delete: if hasMenu('employees') && hasMenu('deleteEmployee')
+        && !existsAfter(directoryPath(employeeId))
+        && !existsAfter(employeeCardPath(employeeId));
+    }
+    match /employeeCards/{employeeId} {
+      allow get: if hasMenu('cards') || (hasMenu('employees') && hasMenu('deleteEmployee'));
+      allow list: if hasMenu('cards');
+      allow create, update: if hasMenu('cards') && validEmployeeCard(employeeId);
+      allow delete: if (hasMenu('cards') || deletingEmployee(employeeId))
+        && !existsAfter(cardUidPath(resource.data.cardUid));
+    }
+    match /cardUids/{cardUid} {
+      allow get: if hasMenu('cards') || hasMenu('terminal');
+      allow list: if hasMenu('cards');
+      // Kart başka personele doğrudan devredilmez: önce teslim alınır (silinir), sonra yeniden verilir.
+      allow create: if hasMenu('cards') && validCardIndex(cardUid);
+      // Eski eşleşme yalnız aynı kart/personel korunarak bir kez assignedAt ile v0.4'e yükseltilebilir.
+      allow update: if hasMenu('cards')
+        && !('assignedAt' in resource.data)
+        && validLegacyCardIndexUpgrade(cardUid);
+      allow delete: if (hasMenu('cards') || deletingEmployee(resource.data.employeeId))
+        && (!existsAfter(employeeCardPath(resource.data.employeeId))
+          || getAfter(employeeCardPath(resource.data.employeeId)).data.cardUid != cardUid)
+        && (!exists(inventoryPath(cardUid)) || cardEventLogged(cardUid));
+    }
+    match /cardInventory/{cardUid} {
+      allow get: if hasMenu('cards') || (hasMenu('employees') && hasMenu('deleteEmployee'));
+      allow list: if hasMenu('cards');
+      allow create: if hasMenu('cards') && validInventoryCard(cardUid)
+        && request.resource.data.events == 0 && request.resource.data.lost == false;
+      // Yalnız numara değişikliği veya geçmişe yazılan tek bir olay (sayaç +1, numara aynı) kabul edilir.
+      allow update: if validInventoryCard(cardUid)
+        && ((hasMenu('cards') && request.resource.data.events == resource.data.events
+              && request.resource.data.lost == resource.data.lost)
+          || ((hasMenu('cards') || (hasMenu('employees') && hasMenu('deleteEmployee')))
+              && request.resource.data.label == resource.data.label
+              && request.resource.data.events == resource.data.events + 1
+              && existsAfter(historyPath(cardUid + '_' + string(request.resource.data.events)))));
+      // Hiç kullanılmamış (geçmişi olmayan) ve atanmamış kart silinebilir.
+      allow delete: if hasMenu('cards') && resource.data.events == 0 && !existsAfter(cardUidPath(cardUid));
+    }
+    match /cardHistory/{historyId} {
+      allow read: if hasMenu('cards');
+      allow create: if (hasMenu('cards')
+          || (request.resource.data.action == 'returned' && deletingEmployee(request.resource.data.employeeId)))
+        && validCardHistory(historyId);
+      allow update, delete: if false;
+    }
+    match /entries/{entryId} {
+      allow read: if hasMenu('dashboard') || hasMenu('timesheet') || hasMenu('reports') || (hasMenu('employees') && hasMenu('deleteEmployee'));
+      // Terminal yalnız son 7 günün kaydını tek tek okuyabilir (çevrimdışı okutmaların sırayla işlenmesi için).
+      allow get: if hasMenu('terminal') && (resource == null || terminalReadableDate(resource.data.date));
+      allow create: if (hasMenu('timesheet') && validEntry(entryId) && createRateAllowed() && matchingClockInClosed(entryId))
+        || (hasMenu('terminal') && terminalEntryCreate(entryId));
+      allow update: if (hasMenu('timesheet') && validEntry(entryId) && updateRateAllowed() && matchingClockInClosed(entryId))
+        || (hasMenu('terminal') && terminalEntryUpdate());
+      allow delete: if canEditRates()
+        || (hasMenu('timesheet') && resource.data.get('rate', null) == null)
+        || (deletingEmployee(resource.data.employeeId)
+          && resource.data.id == entryId
+          && entryId == resource.data.employeeId + '_' + resource.data.date);
+    }
+    match /clockIns/{clockId} {
+      // Terminal yalnız okutma sırasında son 7 günün tek açık girişini okuyabilir; koleksiyonu listeleyemez.
+      allow get: if (hasMenu('terminal') && (resource == null || terminalReadableDate(resource.data.date)))
+        || hasMenu('timesheet') || hasMenu('dashboard')
+        || (hasMenu('employees') && hasMenu('deleteEmployee'));
+      allow list: if hasMenu('timesheet') || hasMenu('dashboard')
+        || (hasMenu('employees') && hasMenu('deleteEmployee'));
+      allow create: if hasMenu('terminal') && validClockIn(clockId);
+      allow update: if false;
+      // Puantaj/terminal yalnız aynı işlemde eşleşen günlük kaydı yazarken açık girişi kapatır.
+      allow delete: if ((hasMenu('timesheet') || hasMenu('terminal')) && existsAfter(entryPath(clockId)))
+        || (deletingEmployee(resource.data.employeeId)
+          && resource.data.id == clockId
+          && clockId == resource.data.employeeId + '_' + resource.data.date);
+    }
+    match /config/{configId} {
+      allow read: if isAdmin() || hasMenu('dashboard') || hasMenu('employees') || hasMenu('timesheet') || hasMenu('reports') || hasMenu('settings');
+      // hasMenu() yöneticiyi zaten kapsar.
+      allow write: if (configId == 'settings' && hasMenu('settings') && validSettings())
+        || (configId != 'settings' && isAdmin());
+    }
+  }
+}

@@ -1,0 +1,105 @@
+{
+  "name": "open-attendance-terminal",
+  "version": "0.4.1",
+  "private": false,
+  "type": "module",
+  "engines": {
+    "node": ">=24.12.0"
+  },
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "desktop": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "build": "vite build",
+    "deneme": "concurrently --kill-others-on-fail -n emulator,veri,uygulama \"npx firebase-tools@15.35.0 emulators:start --only firestore,auth --project demo-open-attendance --config firebase.sandbox.json\" \"node scripts/sandbox-seed.mjs\" \"vite --mode sandbox --host 127.0.0.1 --port 5174 --strictPort\"",
+    "icon": "node scripts/build-icon.mjs",
+    "test": "npm run test:unit",
+    "test:logos": "electron scripts/smoke-logos.cjs",
+    "dist:win": "npm run icon && npm run build && electron-builder --win && npm run smoke:package",
+    "smoke:package": "node scripts/smoke-packaged-deps.cjs",
+    "firebase:deploy": "node scripts/firebase-cli.mjs hosting",
+    "firebase:rules": "node scripts/firebase-cli.mjs rules",
+    "test:unit": "node --test src/card-reader.test.js src/reader-reconnect.test.js src/cards.test.js src/clock.test.js src/data.test.js src/dates.test.js src/device-config.test.js src/electron-main.test.js src/electron-serial.test.js src/export-data.test.js src/firmware-audit.test.js src/payroll.test.js src/service-worker.test.js src/ui-regressions.test.js",
+    "test:rules": "npx firebase-tools@15.35.0 emulators:exec --only firestore,auth --project demo-open-attendance-rules \"node --test --test-concurrency=1 src/firestore-rules.test.js src/clock-rules.test.js src/offline-rules.test.js src/cards-flow.test.js src/clock-flow.test.js src/device-rest-flow.test.js\""
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11",
+    "exceljs": "^4.4.0",
+    "firebase": "13.2.0",
+    "lucide-react": "1.69.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@electron/asar": "3.4.1",
+    "@firebase/rules-unit-testing": "^6.0.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "concurrently": "^10.0.6",
+    "electron": "45.2.3",
+    "electron-builder": "^26.18.0",
+    "png-to-ico": "^3.0.2",
+    "vite": "^8.3.6",
+    "wait-on": "^9.5.1"
+  },
+  "overrides": {
+    "@grpc/grpc-js": "^1.13.6",
+    "uuid": "^11.1.1"
+  },
+  "build": {
+    "appId": "dev.openattendance.terminal",
+    "productName": "Open Attendance Terminal",
+
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraFiles": [
+      {
+        "from": "KURULUM.md",
+        "to": "KURULUM.md"
+      },
+      {
+        "from": "firestore.rules",
+        "to": "firestore.rules"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "artifactName": "OpenAttendance-Terminal-Setup-${version}.exe",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "allowScripts": {
+    "@firebase/util@1.15.3": true,
+    "esbuild@0.28.2": true,
+    "protobufjs@7.6.6": true,
+    "electron-winstaller@5.4.0": true
+  },
+  "description": "Bilingual open-source attendance terminal with Electron, Firebase and ESP32 RFID hardware.",
+  "license": "GPL-3.0-only",
+  "homepage": "https://github.com/yunusemresahin92-cmd/open-attendance-terminal",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yunusemresahin92-cmd/open-attendance-terminal.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yunusemresahin92-cmd/open-attendance-terminal/issues"
+  }
+}
