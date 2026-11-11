@@ -26,7 +26,7 @@
     "electron-updater": "6.8.11",
     "exceljs": "^4.4.0",
     "firebase": "13.2.0",
-    "lucide-react": "1.69.0",
+    "lucide-react": "1.70.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
